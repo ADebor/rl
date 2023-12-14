@@ -68,6 +68,7 @@ other cases, the action written in the tensordict is simply the network output.
     :template: rl_template_noinherit.rst
 
     AdditiveGaussianWrapper
+    EGreedyModule
     EGreedyWrapper
     OrnsteinUhlenbeckProcessWrapper
 
@@ -308,6 +309,7 @@ Regular modules
 
     MLP
     ConvNet
+    Conv3dNet
     LSTMNet
     SqueezeLayer
     Squeeze2dLayer
@@ -331,6 +333,11 @@ algorithms, such as DQN, DDPG or Dreamer.
     DistributionalDQNnet
     DreamerActor
     DuelingCnnDQNet
+    GRUCell
+    GRU
+    GRUModule
+    LSTMCell
+    LSTM
     LSTMModule
     ObsDecoder
     ObsEncoder
@@ -349,6 +356,7 @@ multi-agent contexts.
     :template: rl_template_noinherit.rst
 
     MultiAgentMLP
+    MultiAgentConvNet
     QMixer
     VDNMixer
 

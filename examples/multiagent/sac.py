@@ -23,6 +23,7 @@ from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.modules.models.multiagent import MultiAgentMLP
 from torchrl.objectives import DiscreteSACLoss, SACLoss, SoftUpdate, ValueEstimators
 from utils.logging import init_logging, log_evaluation, log_training
+from utils.utils import DoneTransform
 
 
 def rendering_callback(env, td):
@@ -100,8 +101,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
             out_keys=[env.action_key],
             distribution_class=TanhNormal,
             distribution_kwargs={
-                "min": env.unbatched_action_spec[("agents", "action")].space.minimum,
-                "max": env.unbatched_action_spec[("agents", "action")].space.maximum,
+                "min": env.unbatched_action_spec[("agents", "action")].space.low,
+                "max": env.unbatched_action_spec[("agents", "action")].space.high,
             },
             return_log_prob=True,
         )
@@ -179,6 +180,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         storing_device=cfg.train.device,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
+        postproc=DoneTransform(reward_key=env.reward_key, done_keys=env.done_keys),
     )
 
     replay_buffer = TensorDictReplayBuffer(
@@ -189,12 +191,17 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
     if cfg.env.continuous_actions:
         loss_module = SACLoss(
-            actor_network=policy, qvalue_network=value_module, delay_qvalue=True
+            actor_network=policy,
+            qvalue_network=value_module,
+            delay_qvalue=True,
+            action_spec=env.unbatched_action_spec,
         )
         loss_module.set_keys(
             state_action_value=("agents", "state_action_value"),
             action=env.action_key,
             reward=env.reward_key,
+            done=("agents", "done"),
+            terminated=("agents", "terminated"),
         )
     else:
         loss_module = DiscreteSACLoss(
@@ -208,6 +215,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
             action_value=("agents", "action_value"),
             action=env.action_key,
             reward=env.reward_key,
+            done=("agents", "done"),
+            terminated=("agents", "terminated"),
         )
 
     loss_module.make_value_estimator(ValueEstimators.TD0, gamma=cfg.loss.gamma)
@@ -232,13 +241,6 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
         sampling_time = time.time() - sampling_start
 
-        tensordict_data.set(
-            ("next", "done"),
-            tensordict_data.get(("next", "done"))
-            .unsqueeze(-1)
-            .expand(tensordict_data.get(("next", env.reward_key)).shape),
-        )  # We need to expand the done to match the reward shape
-
         current_frames = tensordict_data.numel()
         total_frames += current_frames
         data_view = tensordict_data.reshape(-1)
@@ -256,7 +258,6 @@ def train(cfg: "DictConfig"):  # noqa: F821
                     loss_vals["loss_actor"]
                     + loss_vals["loss_alpha"]
                     + loss_vals["loss_qvalue"]
-                    + loss_vals["loss_alpha"]
                 )
 
                 loss_value.backward()

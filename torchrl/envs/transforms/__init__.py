@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from .gym_transforms import EndOfLifeTransform
 from .r3m import R3MTransform
 from .rlhf import KLRewardTransform
 from .transforms import (
@@ -11,6 +12,7 @@ from .transforms import (
     CatFrames,
     CatTensors,
     CenterCrop,
+    ClipTransform,
     Compose,
     DeviceCastTransform,
     DiscreteActionProjection,
@@ -26,6 +28,7 @@ from .transforms import (
     NoopResetEnv,
     ObservationNorm,
     ObservationTransform,
+    PermuteTransform,
     PinMemoryTransform,
     RandomCropTensorDict,
     RenameTransform,
@@ -44,6 +47,7 @@ from .transforms import (
     Transform,
     TransformedEnv,
     UnsqueezeTransform,
+    VecGymEnvTransform,
     VecNorm,
 )
 from .vc1 import VC1Transform

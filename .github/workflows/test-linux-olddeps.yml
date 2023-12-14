@@ -11,6 +11,10 @@ on:
 
 jobs:
   unittests:
+    strategy:
+      matrix:
+        python_version: ["3.8"]
+        cuda_arch_version: ["11.6"]
     uses: pytorch/test-infra/.github/workflows/linux_job.yml@main
     with:
       repository: pytorch/rl
@@ -28,6 +32,6 @@ jobs:
         export TF_CPP_MIN_LOG_LEVEL=0
 
 
-        bash .circleci/unittest/linux_olddeps/scripts_gym_0_13/setup_env.sh
-        bash .circleci/unittest/linux_olddeps/scripts_gym_0_13/batch_scripts.sh
-        bash .circleci/unittest/linux_olddeps/scripts_gym_0_13/post_process.sh
+        bash .github/unittest/linux_olddeps/scripts_gym_0_13/setup_env.sh
+        bash .github/unittest/linux_olddeps/scripts_gym_0_13/batch_scripts.sh
+        bash .github/unittest/linux_olddeps/scripts_gym_0_13/post_process.sh

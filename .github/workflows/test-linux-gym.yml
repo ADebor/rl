@@ -17,6 +17,10 @@ concurrency:
 
 jobs:
   unittests:
+    strategy:
+      matrix:
+        python_version: ["3.9"]
+        cuda_arch_version: ["12.1"]
     uses: pytorch/test-infra/.github/workflows/linux_job.yml@main
     with:
       repository: pytorch/rl
@@ -27,12 +31,12 @@ jobs:
       timeout: 120
       script: |
         set -euxo pipefail
-        export PYTHON_VERSION="3.8"
+        export PYTHON_VERSION="3.9"
         # export CU_VERSION="${{ inputs.gpu-arch-version }}"
         export CU_VERSION="11.4"
         export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/work/mujoco-py/mujoco_py/binaries/linux/mujoco210/bin"
         export TAR_OPTIONS="--no-same-owner"
 
-        ./.circleci/unittest/linux_libs/scripts_gym/setup_env.sh
-        ./.circleci/unittest/linux_libs/scripts_gym/batch_scripts.sh
-        ./.circleci/unittest/linux_libs/scripts_gym/post_process.sh
+        ./.github/unittest/linux_libs/scripts_gym/setup_env.sh
+        ./.github/unittest/linux_libs/scripts_gym/batch_scripts.sh
+        ./.github/unittest/linux_libs/scripts_gym/post_process.sh

@@ -2,6 +2,7 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+from __future__ import annotations
 
 import collections
 
@@ -18,11 +19,13 @@ from copy import copy
 from distutils.util import strtobool
 from functools import wraps
 from importlib import import_module
-from typing import Any, Callable, cast, TypeVar, Union
+from typing import Any, Callable, cast, Dict, TypeVar, Union
 
 import numpy as np
 import torch
 from packaging.version import parse
+from torch import multiprocessing as mp
+
 
 VERBOSE = strtobool(os.environ.get("VERBOSE", "0"))
 _os_is_windows = sys.platform == "win32"
@@ -248,6 +251,7 @@ class implement_for:
     # Stores pointers to fitting implementations: dict[func_name] = func_pointer
     _implementations = {}
     _setters = []
+    _cache_modules = {}
 
     def __init__(
         self,
@@ -269,35 +273,87 @@ class implement_for:
     @staticmethod
     def get_class_that_defined_method(f):
         """Returns the class of a method, if it is defined, and None otherwise."""
-        return f.__globals__.get(f.__qualname__.split(".")[0], None)
+        out = f.__globals__.get(f.__qualname__.split(".")[0], None)
+        return out
 
-    @property
-    def func_name(self):
-        return self.fn.__name__
+    @classmethod
+    def get_func_name(cls, fn):
+        # produces a name like torchrl.module.Class.method or torchrl.module.function
+        first = str(fn).split(".")[0][len("<function ") :]
+        last = str(fn).split(".")[1:]
+        if last:
+            first = [first]
+            last[-1] = last[-1].split(" ")[0]
+        else:
+            last = [first.split(" ")[0]]
+            first = []
+        return ".".join([fn.__module__] + first + last)
 
-    def module_set(self):
-        """Sets the function in its module, if it exists already."""
-        cls = self.get_class_that_defined_method(self.fn)
+    def _get_cls(self, fn):
+        cls = self.get_class_that_defined_method(fn)
         if cls is None:
             # class not yet defined
             return
         if cls.__class__.__name__ == "function":
-            cls = inspect.getmodule(self.fn)
+            cls = inspect.getmodule(fn)
+        return cls
+
+    def module_set(self):
+        """Sets the function in its module, if it exists already."""
+        prev_setter = type(self)._implementations.get(self.get_func_name(self.fn), None)
+        if prev_setter is not None:
+            prev_setter.do_set = False
+        type(self)._implementations[self.get_func_name(self.fn)] = self
+        cls = self.get_class_that_defined_method(self.fn)
+        if cls is not None:
+            if cls.__class__.__name__ == "function":
+                cls = inspect.getmodule(self.fn)
+        else:
+            # class not yet defined
+            return
         setattr(cls, self.fn.__name__, self.fn)
 
-    @staticmethod
-    def import_module(module_name: Union[Callable, str]) -> str:
+    @classmethod
+    def import_module(cls, module_name: Union[Callable, str]) -> str:
         """Imports module and returns its version."""
         if not callable(module_name):
-            module = import_module(module_name)
+            module = cls._cache_modules.get(module_name, None)
+            if module is None:
+                if module_name in sys.modules:
+                    sys.modules[module_name] = module = import_module(module_name)
+                else:
+                    cls._cache_modules[module_name] = module = import_module(
+                        module_name
+                    )
         else:
             module = module_name()
         return module.__version__
 
+    _lazy_impl = collections.defaultdict(list)
+
+    def _delazify(self, func_name):
+        for local_call in implement_for._lazy_impl[func_name]:
+            out = local_call()
+        return out
+
     def __call__(self, fn):
+        # function names are unique
+        self.func_name = self.get_func_name(fn)
         self.fn = fn
+        implement_for._lazy_impl[self.func_name].append(self._call)
+
+        @wraps(fn)
+        def _lazy_call_fn(*args, **kwargs):
+            # first time we call the function, we also do the replacement.
+            # This will cause the imports to occur only during the first call to fn
+            return self._delazify(self.func_name)(*args, **kwargs)
+
+        return _lazy_call_fn
+
+    def _call(self):
 
         # If the module is missing replace the function with the mock.
+        fn = self.fn
         func_name = self.func_name
         implementations = implement_for._implementations
 
@@ -307,7 +363,7 @@ class implement_for:
                 f"Supported version of '{func_name}' has not been found."
             )
 
-        do_set = False
+        self.do_set = False
         # Return fitting implementation if it was encountered before.
         if func_name in implementations:
             try:
@@ -320,36 +376,45 @@ class implement_for:
                             f"Got multiple backends for {func_name}. "
                             f"Using the last queried ({module} with version {version})."
                         )
-                    do_set = True
-                if not do_set:
-                    return implementations[func_name]
+                    self.do_set = True
+                if not self.do_set:
+                    return implementations[func_name].fn
             except ModuleNotFoundError:
                 # then it's ok, there is no conflict
-                return implementations[func_name]
+                return implementations[func_name].fn
         else:
             try:
                 version = self.import_module(self.module_name)
                 if self.check_version(version, self.from_version, self.to_version):
-                    do_set = True
+                    self.do_set = True
             except ModuleNotFoundError:
                 return unsupported
-        if do_set:
-            implementations[func_name] = fn
+        if self.do_set:
             self.module_set()
             return fn
         return unsupported
 
     @classmethod
-    def reset(cls, setters=None):
+    def reset(cls, setters_dict: Dict[str, implement_for] = None):
+        """Resets the setters in setter_dict.
+
+        ``setter_dict`` is a copy of implementations. We just need to iterate through its
+        values and call :meth:`~.module_set` for each.
+
+        """
         if VERBOSE:
             print("resetting implement_for")
-        if setters is None:
-            setters = copy(cls._setters)
-        cls._setters = []
-        cls._implementations = {}
-        for setter in setters:
-            setter(setter.fn)
-            cls._setters.append(setter)
+        if setters_dict is None:
+            setters_dict = copy(cls._implementations)
+        for setter in setters_dict.values():
+            setter.module_set()
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"module_name={self.module_name}({self.from_version, self.to_version}), "
+            f"fn_name={self.fn.__name__}, cls={self._get_cls(self.fn)}, is_set={self.do_set})"
+        )
 
 
 def accept_remote_rref_invocation(func):
@@ -529,3 +594,70 @@ class _DecoratorContextManager:
 def get_trace():
     """A simple debugging util to spot where a function is being called."""
     traceback.print_stack()
+
+
+class _ProcessNoWarn(mp.Process):
+    """A private Process class that shuts down warnings on the subprocess and controls the number of threads in the subprocess."""
+
+    @wraps(mp.Process.__init__)
+    def __init__(self, *args, num_threads=None, **kwargs):
+        import torchrl
+
+        self.filter_warnings_subprocess = torchrl.filter_warnings_subprocess
+        self.num_threads = num_threads
+        super().__init__(*args, **kwargs)
+
+    def run(self, *args, **kwargs):
+        if self.num_threads is not None:
+            torch.set_num_threads(self.num_threads)
+        if self.filter_warnings_subprocess:
+            import warnings
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return mp.Process.run(self, *args, **kwargs)
+        return mp.Process.run(self, *args, **kwargs)
+
+
+def print_directory_tree(path, indent="", display_metadata=True):
+    """Prints the directory tree starting from the specified path.
+
+    Args:
+        path (str): The path of the directory to print.
+        indent (str): The current indentation level for formatting.
+        display_metadata (bool): if ``True``, metadata of the dir will be
+            displayed too.
+
+    """
+    if display_metadata:
+
+        def get_directory_size(path="."):
+            total_size = 0
+
+            for dirpath, _, filenames in os.walk(path):
+                for filename in filenames:
+                    file_path = os.path.join(dirpath, filename)
+                    total_size += os.path.getsize(file_path)
+
+            return total_size
+
+        def format_size(size):
+            # Convert size to a human-readable format
+            for unit in ["B", "KB", "MB", "GB", "TB"]:
+                if size < 1024.0:
+                    return f"{size:.2f} {unit}"
+                size /= 1024.0
+
+        total_size_bytes = get_directory_size(path)
+        formatted_size = format_size(total_size_bytes)
+        print(f"Directory size: {formatted_size}")
+
+    if os.path.isdir(path):
+        print(indent + os.path.basename(path) + "/")
+        indent += "    "
+        for item in os.listdir(path):
+            print_directory_tree(
+                os.path.join(path, item), indent=indent, display_metadata=False
+            )
+    else:
+        print(indent + os.path.basename(path))

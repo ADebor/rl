@@ -4,9 +4,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import collections
+import json
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -230,6 +232,7 @@ class ReplayBuffer:
             "_storage": self._storage.state_dict(),
             "_sampler": self._sampler.state_dict(),
             "_writer": self._writer.state_dict(),
+            "_transforms": self._transform.state_dict(),
             "_batch_size": self._batch_size,
         }
 
@@ -237,7 +240,79 @@ class ReplayBuffer:
         self._storage.load_state_dict(state_dict["_storage"])
         self._sampler.load_state_dict(state_dict["_sampler"])
         self._writer.load_state_dict(state_dict["_writer"])
+        self._transform.load_state_dict(state_dict["_transforms"])
         self._batch_size = state_dict["_batch_size"]
+
+    def dumps(self, path):
+        """Saves the replay buffer on disk at the specified path.
+
+        Args:
+            path (Path or str): path where to save the replay buffer.
+
+        Examples:
+            >>> import tempfile
+            >>> import tqdm
+            >>> from torchrl.data import LazyMemmapStorage, TensorDictReplayBuffer
+            >>> from torchrl.data.replay_buffers.samplers import PrioritizedSampler, RandomSampler
+            >>> import torch
+            >>> from tensordict import TensorDict
+            >>> # Build and populate the replay buffer
+            >>> S = 1_000_000
+            >>> sampler = PrioritizedSampler(S, 1.1, 1.0)
+            >>> # sampler = RandomSampler()
+            >>> storage = LazyMemmapStorage(S)
+            >>> rb = TensorDictReplayBuffer(storage=storage, sampler=sampler)
+            >>>
+            >>> for _ in tqdm.tqdm(range(100)):
+            ...     td = TensorDict({"obs": torch.randn(100, 3, 4), "next": {"obs": torch.randn(100, 3, 4)}, "td_error": torch.rand(100)}, [100])
+            ...     rb.extend(td)
+            ...     sample = rb.sample(32)
+            ...     rb.update_tensordict_priority(sample)
+            >>> # save and load the buffer
+            >>> with tempfile.TemporaryDirectory() as tmpdir:
+            ...     rb.dumps(tmpdir)
+            ...
+            ...     sampler = PrioritizedSampler(S, 1.1, 1.0)
+            ...     # sampler = RandomSampler()
+            ...     storage = LazyMemmapStorage(S)
+            ...     rb_load = TensorDictReplayBuffer(storage=storage, sampler=sampler)
+            ...     rb_load.loads(tmpdir)
+            ...     assert len(rb) == len(rb_load)
+
+        """
+        path = Path(path).absolute()
+        path.mkdir(exist_ok=True)
+        self._storage.dumps(path / "storage")
+        self._sampler.dumps(path / "sampler")
+        self._writer.dumps(path / "writer")
+        # fall back on state_dict for transforms
+        transform_sd = self._transform.state_dict()
+        if transform_sd:
+            torch.save(transform_sd, path / "transform.t")
+        with open(path / "buffer_metadata.json", "w") as file:
+            json.dump({"batch_size": self._batch_size}, file)
+
+    def loads(self, path):
+        """Loads a replay buffer state at the given path.
+
+        The buffer should have matching components and be saved using :meth:`~.dumps`.
+
+        Args:
+            path (Path or str): path where the replay buffer was saved.
+
+        See :meth:`~.dumps` for more info.
+
+        """
+        path = Path(path).absolute()
+        self._storage.loads(path / "storage")
+        self._sampler.loads(path / "sampler")
+        self._writer.loads(path / "writer")
+        # fall back on state_dict for transforms
+        if (path / "transform.t").exists():
+            self._transform.load_state_dict(torch.load(path / "transform.t"))
+        with open(path / "buffer_metadata.json", "r") as file:
+            metadata = json.load(file)
+        self._batch_size = metadata["batch_size"]
 
     def add(self, data: Any) -> int:
         """Add a single element to the replay buffer.
@@ -662,7 +737,7 @@ class TensorDictReplayBuffer(ReplayBuffer):
         super().__init__(**kw)
         self.priority_key = priority_key
 
-    def _get_priority(self, tensordict: TensorDictBase) -> Optional[torch.Tensor]:
+    def _get_priority_item(self, tensordict: TensorDictBase) -> float:
         if "_data" in tensordict.keys():
             tensordict = tensordict.get("_data")
 
@@ -680,6 +755,23 @@ class TensorDictReplayBuffer(ReplayBuffer):
                 f" {tensordict.get(self.priority_key).shape} but expected "
                 f"scalar value"
             )
+        return priority
+
+    def _get_priority_vector(self, tensordict: TensorDictBase) -> torch.Tensor:
+        if "_data" in tensordict.keys():
+            tensordict = tensordict.get("_data")
+
+        priority = tensordict.get(self.priority_key, None)
+        if priority is None:
+            return torch.tensor(
+                self._sampler.default_priority,
+                dtype=torch.float,
+                device=tensordict.device,
+            ).expand(tensordict.shape[0])
+
+        priority = priority.reshape(priority.shape[0], -1)
+        priority = _reduce(priority, self._sampler.reduction, dim=1)
+
         return priority
 
     def add(self, data: TensorDictBase) -> int:
@@ -701,69 +793,59 @@ class TensorDictReplayBuffer(ReplayBuffer):
             data_add = data
 
         index = super()._add(data_add)
-        if is_tensor_collection(data_add):
-            data_add.set("index", index)
+        if index is not None:
+            if is_tensor_collection(data_add):
+                data_add.set("index", index)
 
-        # priority = self._get_priority(data)
-        # if priority:
-        self.update_tensordict_priority(data_add)
+            # priority = self._get_priority(data)
+            # if priority:
+            self.update_tensordict_priority(data_add)
         return index
 
-    def extend(self, tensordicts: Union[List, TensorDictBase]) -> torch.Tensor:
-        if is_tensor_collection(tensordicts):
-            tensordicts = TensorDict(
-                {"_data": tensordicts},
-                batch_size=tensordicts.batch_size[:1],
-            )
-            if tensordicts.batch_dims > 1:
-                # we want the tensordict to have one dimension only. The batch size
-                # of the sampled tensordicts can be changed thereafter
-                if not isinstance(tensordicts, LazyStackedTensorDict):
-                    tensordicts = tensordicts.clone(recurse=False)
-                else:
-                    tensordicts = tensordicts.contiguous()
-                # we keep track of the batch size to reinstantiate it when sampling
-                if "_rb_batch_size" in tensordicts.keys():
-                    raise KeyError(
-                        "conflicting key '_rb_batch_size'. Consider removing from data."
-                    )
-                shape = torch.tensor(tensordicts.batch_size[1:]).expand(
-                    tensordicts.batch_size[0], tensordicts.batch_dims - 1
-                )
-                tensordicts.set("_rb_batch_size", shape)
-            tensordicts.set(
-                "index",
-                torch.zeros(
-                    tensordicts.shape, device=tensordicts.device, dtype=torch.int
-                ),
-            )
+    def extend(self, tensordicts: TensorDictBase) -> torch.Tensor:
 
-        if not is_tensor_collection(tensordicts):
-            stacked_td = torch.stack(tensordicts, 0)
-        else:
-            stacked_td = tensordicts
+        tensordicts = TensorDict(
+            {"_data": tensordicts},
+            batch_size=tensordicts.batch_size[:1],
+        )
+        if tensordicts.batch_dims > 1:
+            # we want the tensordict to have one dimension only. The batch size
+            # of the sampled tensordicts can be changed thereafter
+            if not isinstance(tensordicts, LazyStackedTensorDict):
+                tensordicts = tensordicts.clone(recurse=False)
+            else:
+                tensordicts = tensordicts.contiguous()
+            # we keep track of the batch size to reinstantiate it when sampling
+            if "_rb_batch_size" in tensordicts.keys():
+                raise KeyError(
+                    "conflicting key '_rb_batch_size'. Consider removing from data."
+                )
+            shape = torch.tensor(tensordicts.batch_size[1:]).expand(
+                tensordicts.batch_size[0], tensordicts.batch_dims - 1
+            )
+            tensordicts.set("_rb_batch_size", shape)
+        tensordicts.set(
+            "index",
+            torch.zeros(tensordicts.shape, device=tensordicts.device, dtype=torch.int),
+        )
 
         if self._transform is not None:
-            tensordicts = self._transform.inv(stacked_td.get("_data"))
-            stacked_td.set("_data", tensordicts)
-            if tensordicts.device is not None:
-                stacked_td = stacked_td.to(tensordicts.device)
+            data = self._transform.inv(tensordicts.get("_data"))
+            tensordicts.set("_data", data)
+            if data.device is not None:
+                tensordicts = tensordicts.to(data.device)
 
-        index = super()._extend(stacked_td)
-        self.update_tensordict_priority(stacked_td)
+        index = super()._extend(tensordicts)
+        self.update_tensordict_priority(tensordicts)
         return index
 
     def update_tensordict_priority(self, data: TensorDictBase) -> None:
         if not isinstance(self._sampler, PrioritizedSampler):
             return
         if data.ndim:
-            priority = torch.tensor(
-                [self._get_priority(td) for td in data],
-                dtype=torch.float,
-                device=data.device,
-            )
+            priority = self._get_priority_vector(data)
         else:
-            priority = self._get_priority(data)
+            priority = self._get_priority_item(data)
         index = data.get("index")
         while index.shape != priority.shape:
             # reduce index
@@ -1010,17 +1092,23 @@ class InPlaceSampler:
         return self.out
 
 
-def _reduce(tensor: torch.Tensor, reduction: str):
+def _reduce(
+    tensor: torch.Tensor, reduction: str, dim: Optional[int] = None
+) -> Union[float, torch.Tensor]:
     """Reduces a tensor given the reduction method."""
     if reduction == "max":
-        return tensor.max().item()
+        result = tensor.max(dim=dim)
     elif reduction == "min":
-        return tensor.min().item()
+        result = tensor.min(dim=dim)
     elif reduction == "mean":
-        return tensor.mean().item()
+        result = tensor.mean(dim=dim)
     elif reduction == "median":
-        return tensor.median().item()
-    raise NotImplementedError(f"Unknown reduction method {reduction}")
+        result = tensor.median(dim=dim)
+    else:
+        raise NotImplementedError(f"Unknown reduction method {reduction}")
+    if isinstance(result, tuple):
+        result = result[0]
+    return result.item() if dim is None else result
 
 
 def stack_tensors(list_of_tensor_iterators: List) -> Tuple[torch.Tensor]:

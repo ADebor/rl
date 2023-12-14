@@ -123,7 +123,7 @@ def test_gae_speed(benchmark, gae_fn, gamma_tensor, batches, timesteps):
 
     gamma = 0.99
     if gamma_tensor:
-        gamma = torch.full(size, gamma)
+        gamma = torch.full(size, gamma, device=device)
     lmbda = 0.95
 
     benchmark(
@@ -435,7 +435,7 @@ def test_td3_speed(benchmark, n_obs=8, n_act=4, ncells=128, batch=128, n_hidden=
     loss = TD3Loss(
         actor,
         value,
-        action_spec=BoundedTensorSpec(shape=(n_act,), minimum=-1, maximum=1),
+        action_spec=BoundedTensorSpec(shape=(n_act,), low=-1, high=1),
     )
 
     loss(td)
